@@ -1,9 +1,9 @@
 {
   "manifestVersion": 2,
-  "publisher": "selfhosted",
-  "name": "omp-native-bridge",
+  "publisher": "hl9565",
+  "name": "pelican-test",
   "displayName": "Pelican Test",
-  "version": "0.9.0",
+  "version": "1.0.0",
   "description": "Run manual and scheduled SVG pelican tests.",
   "license": "Apache-2.0",
   "engines": {

@@ -20,7 +20,7 @@ use tokio::{
 #[path = "rpc/pelican.rs"]
 mod pelican;
 
-const BIN: &str = env!("CARGO_BIN_EXE_cpr-omp-native-bridge");
+const BIN: &str = env!("CARGO_BIN_EXE_cpr-pelican-test");
 const STEP_TIMEOUT: Duration = Duration::from_secs(10);
 const INSTANCE: &str = "test-instance";
 const INCARNATION: &str = "test-incarnation";
