@@ -3,7 +3,7 @@
   "publisher": "hl9565",
   "name": "pelican-test",
   "displayName": "Pelican Test",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Run manual and scheduled SVG pelican tests.",
   "license": "Apache-2.0",
   "engines": {

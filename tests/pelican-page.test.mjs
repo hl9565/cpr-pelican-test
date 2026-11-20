@@ -581,13 +581,14 @@ test('hosted manual button enqueues refinement, selects main SVG, and opens exte
   assert.equal(directCalls, 0);
 });
 
-test('hosted history flips to the older page and fetches full source only when opened', async () => {
+test('hosted history hydrates older thumbnails and shares the pending source request', async () => {
   const original = archivedRecord(0, '<svg><title>older ride</title><!--' + 'x'.repeat(80_000) + '--></svg>');
   const recent = Array.from({ length: 20 }, (_, n) => archivedRecord(20 - n, '<svg></svg>'));
   const calls = [];
   const opened = [];
   let ticketCount = 0;
   let inClick = false;
+  let finishRecord;
   const status = new TextEncoder();
   const bridge = {
     version: 2,
@@ -607,7 +608,10 @@ test('hosted history flips to the older page and fetches full source only when o
         calls.push({ path, query });
         if (path === 'history') data = { total: 21, snapshot: 21,
           records: query ? [{ ...original, source: null, hasSource: true }] : recent };
-        else if (path === 'history/record') data = { record: original };
+        else if (path === 'history/record') {
+          await new Promise(resolve => { finishRecord = resolve; });
+          data = { record: original };
+        }
         else throw new Error('Unexpected route ' + path);
       }
       return { status: 200, body: status.encode(JSON.stringify(data)).buffer };
@@ -618,16 +622,19 @@ test('hosted history flips to the older page and fetches full source only when o
   assert.equal(ticketCount, 1);
   assert.equal(elements.get('history-count').textContent, '21 条');
   assert.equal(elements.get('history-rows').children.length, 20);
+  assert.deepEqual(calls, [{ path: 'history', query: undefined }]);
   await elements.get('history-next').fire('click');
-  assert.deepEqual(calls.at(-1), { path: 'history', query: 'offset=20&snapshot=21' });
+  const recordCall = { path: 'history/record', query: 'id=' + original.id };
+  assert.deepEqual(calls.slice(1), [{ path: 'history', query: 'offset=20&snapshot=21' }, recordCall]);
   assert.equal(elements.get('history-page').textContent, '第 2 / 2 页');
   assert.equal(elements.get('history-next').disabled, true);
   assert.equal(elements.get('history-rows').children.length, 1);
   const actions = elements.get('history-rows').children[0].children[5].children[0];
-  assert.equal(actions.children[0].children.at(-1).className, 'thumb-marker');
+  const thumb = actions.children[0];
+  assert.deepEqual(thumb.children.map(child => child.className), ['thumb-marker']);
   assert.match(elements.get('history-hint').textContent, /新标签页播放/);
   inClick = true;
-  const click = actions.children[0].fire('click');
+  const click = thumb.fire('click');
   inClick = false;
   assert.deepEqual(opened, [{ url: 'https://cpr.example.test/cb?state=1&id=' + original.id, inClick: true }]);
   await click;
@@ -635,13 +642,166 @@ test('hosted history flips to the older page and fetches full source only when o
   assert.equal(ticketCount, 2);
   assert.equal(elements.get('preview-dialog').open, false);
   assert.match(elements.get('history-hint').textContent, /宿主弹出的确认框.*打开链接/);
-  assert.equal(calls.some(call => call.path === 'history/record'), false);
-  await actions.children[1].fire('click');
-  assert.deepEqual(calls.at(-1), { path: 'history/record', query: 'id=' + original.id });
+  const sourceClick = actions.children[1].fire('click');
+  const recordCalls = () => calls.filter(call => call.path === 'history/record');
+  assert.deepEqual(recordCalls(), [recordCall]);
+  finishRecord();
+  await sourceClick;
+  await tick();
+  const [image, marker] = thumb.children;
+  assert.equal(image.tagName, 'IMG');
+  assert.equal(image.alt, '');
+  assert.equal(image.loading, 'lazy');
+  assert.equal(image.decoding, 'async');
+  assert.match(decodeURIComponent(image.src), /<title>older ride<\/title>/);
+  assert.equal(marker.className, 'thumb-marker');
   assert.equal(elements.get('preview-dialog').open, true);
   assert.equal(elements.get('dialog-source').textContent, original.source);
+  await elements.get('close-dialog').fire('click');
   await elements.get('history-prev').fire('click');
   assert.equal(elements.get('history-rows').children.length, 20);
+  await elements.get('history-next').fire('click');
+  const returnedActions = elements.get('history-rows').children[0].children[5].children[0];
+  assert.equal(returnedActions.children[0].children[0].src, image.src);
+  assert.deepEqual(recordCalls(), [recordCall]);
+  const reopen = returnedActions.children[1].fire('click');
+  assert.deepEqual(recordCalls(), [recordCall, recordCall]);
+  finishRecord();
+  await reopen;
+  assert.equal(elements.get('dialog-source').textContent, original.source);
+  close();
+});
+
+function thumbnailHistoryBridge(firstPage, secondPage, readRecord) {
+  const total = firstPage.length + secondPage.length;
+  return {
+    version: 2,
+    async request({ path, query }) {
+      const routes = {
+        bootstrap: { prompt: PROMPT, keys: [] },
+        schedule: { plans: [], maxPlans: 10 },
+        refine: { job: null, queue: [], maxRounds: 1 },
+        history: { records: query ? secondPage : firstPage, total, snapshot: total },
+      };
+      if (path === 'history/record') return readRecord(query.slice('id='.length));
+      assert.ok(Object.hasOwn(routes, path), 'Unexpected route ' + path);
+      return historyReply(routes[path]);
+    },
+  };
+}
+
+function historyReply(data, status = 200) {
+  return { status, body: new TextEncoder().encode(JSON.stringify(data)) };
+}
+
+function omittedSource(record) {
+  return { ...record, source: null, hasSource: true };
+}
+
+function historyThumbs(elements) {
+  return elements.get('history-rows').children.map(row => row.children[5].children[0].children[0]);
+}
+
+function fullFirstPage(records) {
+  return [...records.map(omittedSource), ...Array.from({ length: 20 - records.length }, (_, index) =>
+    archivedRecord(100 + index, null))];
+}
+
+test('thumbnail hydration limits concurrency and discards queued work on page changes and pagehide', async () => {
+  const [a, b, c, d, e, f, g] = Array.from({ length: 7 }, (_, index) => archivedRecord(index, '<svg></svg>'));
+  const calls = [];
+  const pending = new Map();
+  const bridge = thumbnailHistoryBridge(fullFirstPage([a, b, c, d]), [e, f, g].map(omittedSource), id => {
+    calls.push(id);
+    return new Promise(resolve => pending.set(id, resolve));
+  });
+  const { elements, close } = await page({ bridge });
+  const complete = async record => {
+    const resolve = pending.get(record.id);
+    pending.delete(record.id);
+    resolve(historyReply({ record }));
+    await tick();
+  };
+  assert.deepEqual(calls, [a.id, b.id]);
+  const [previousThumb] = historyThumbs(elements);
+  await elements.get('history-next').fire('click');
+  assert.deepEqual(calls, [a.id, b.id]);
+  await complete(a);
+  assert.deepEqual(calls, [a.id, b.id, e.id]);
+  assert.equal(previousThumb.children.some(child => child.tagName === 'IMG'), false);
+  await complete(b);
+  assert.deepEqual(calls, [a.id, b.id, e.id, f.id]);
+  await complete(e);
+  assert.deepEqual(calls, [a.id, b.id, e.id, f.id, g.id]);
+  const [currentThumb, pendingThumb] = historyThumbs(elements);
+  assert.equal(currentThumb.children[0].tagName, 'IMG');
+
+  await elements.get('history-prev').fire('click');
+  assert.deepEqual(calls, [a.id, b.id, e.id, f.id, g.id]);
+  assert.equal(historyThumbs(elements)[0].children[0].tagName, 'IMG');
+  close();
+  await complete(f);
+  await complete(g);
+  assert.deepEqual(calls, [a.id, b.id, e.id, f.id, g.id]);
+  assert.equal(pendingThumb.children.some(child => child.tagName === 'IMG'), false);
+});
+
+test('thumbnail hydration skips no_svg rows and leaves their source available', async () => {
+  const noSvg = { ...archivedRecord(1, '<html><p>Text only</p></html>'), outcome: 'no_svg' };
+  const generated = archivedRecord(2, '<svg></svg>');
+  const calls = [];
+  const bridge = thumbnailHistoryBridge([noSvg, generated].map(omittedSource), [], id => {
+    calls.push(id);
+    return historyReply({ record: id === noSvg.id ? noSvg : generated });
+  });
+  const { elements, close } = await page({ bridge });
+  const [fallback, hydrated] = historyThumbs(elements);
+  assert.deepEqual(calls, [generated.id]);
+  assert.equal(fallback.textContent, '\u64ad\u653e');
+  assert.equal(fallback.children.some(child => child.tagName === 'IMG'), false);
+  assert.equal(hydrated.children[0].tagName, 'IMG');
+  await elements.get('history-rows').children[0].children[5].children[0].children[1].fire('click');
+  assert.deepEqual(calls, [generated.id, noSvg.id]);
+  assert.equal(elements.get('dialog-source').textContent, noSvg.source);
+  close();
+});
+
+test('thumbnail hydration retries transient failures and caches missing and broken images', async () => {
+  const retry = archivedRecord(1, '<svg><title>Retry</title></svg>');
+  const missing = archivedRecord(2, '<svg></svg>');
+  const broken = archivedRecord(3, '<svg><title>Broken image</title></svg>');
+  const empty = archivedRecord(4, '<html><p>No SVG</p></html>');
+  const records = [retry, missing, broken, empty];
+  const calls = [];
+  const bridge = thumbnailHistoryBridge(fullFirstPage(records), [archivedRecord(0, null)], id => {
+    const firstAttempt = !calls.includes(id);
+    calls.push(id);
+    if (id === retry.id && firstAttempt) return historyReply({ message: 'Temporarily unavailable' }, 503);
+    if (id === missing.id) return { status: 404, body: new TextEncoder().encode('Not found') };
+    return historyReply({ record: records.find(record => record.id === id) });
+  });
+  const { elements, close } = await page({ bridge });
+  const [fallback, missingThumb, brokenThumb, emptyThumb] = historyThumbs(elements);
+  assert.deepEqual(calls, records.map(record => record.id));
+  assert.equal(fallback.textContent, '\u64ad\u653e');
+  assert.deepEqual(fallback.children.map(child => child.className), ['thumb-marker']);
+  assert.equal(missingThumb.children.some(child => child.tagName === 'IMG'), false);
+  assert.equal(emptyThumb.children.some(child => child.tagName === 'IMG'), false);
+  const image = brokenThumb.children[0];
+  assert.equal(image.tagName, 'IMG');
+  await image.fire('error');
+  assert.equal(brokenThumb.textContent, fallback.textContent);
+  assert.deepEqual(brokenThumb.children.map(child => child.className), ['thumb-marker']);
+
+  await elements.get('history-next').fire('click');
+  await elements.get('history-prev').fire('click');
+  await tick();
+  assert.deepEqual(calls, [...records.map(record => record.id), retry.id]);
+  const [retried, stillMissing, stillBroken, stillEmpty] = historyThumbs(elements);
+  assert.match(decodeURIComponent(retried.children[0].src), /<title>Retry<\/title>/);
+  for (const thumb of [stillMissing, stillBroken, stillEmpty]) {
+    assert.deepEqual(thumb.children.map(child => child.className), ['thumb-marker']);
+  }
   close();
 });
 

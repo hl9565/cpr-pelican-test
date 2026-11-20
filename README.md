@@ -4,11 +4,11 @@ Pelican Test is a community plugin for codex-proxy-rs (CPR). It runs a fixed-pro
 
 | Release | CPR plugin ID | Rust crate and binary |
 | --- | --- | --- |
-| `1.0.0` | `hl9565.pelican-test` | `cpr-pelican-test` |
+| `1.0.1` | `hl9565.pelican-test` | `cpr-pelican-test` |
 
 ## Install in CPR
 
-1. In CPR's **Plugin Management**, select **GitHub**, enter `hl9565/cpr-pelican-test`, and select the `v1.0.0` release. For Linux x86_64, choose `hl9565.pelican-test-1.0.0-x86_64-unknown-linux-gnu.tar.gz` and leave download authentication set to none. [GitHub repository](https://github.com/hl9565/cpr-pelican-test) · [GitHub Releases](https://github.com/hl9565/cpr-pelican-test/releases)
+1. In CPR's **Plugin Management**, select **GitHub**, enter `hl9565/cpr-pelican-test`, and select the `v1.0.1` release. For Linux x86_64, choose `hl9565.pelican-test-1.0.1-x86_64-unknown-linux-gnu.tar.gz` and leave download authentication set to none. [GitHub repository](https://github.com/hl9565/cpr-pelican-test) · [GitHub Releases](https://github.com/hl9565/cpr-pelican-test/releases)
 2. For local upload, select **上传包** and choose the downloaded archive or a package you built in `dist/`. In either flow, check the version, target platform, and SHA-256 before installing.
 3. Enable the instance and open **鹈鹕** from its management pages. The page uses existing CPR Client Keys and models.
 
@@ -68,6 +68,11 @@ git diff --check
 The Node tests use fixtures for the page, standalone loopback proxy, schedule controls, history, and playback link handling. Rust unit and process-level RPC tests cover registration, handshake rejection, the literal prompt and optional verbosity, draft completeness, preview callbacks, manual and scheduled queueing, Cron claim recovery, paginated and legacy history, archive quotas, and routed account matching. The offline Cargo commands require the pinned SDK and dependencies in the local Cargo cache.
 
 ## Changelog
+
+### 1.0.1
+
+- Hydrate and LRU-cache SVG thumbnails on demand for large archived outputs (> 16 KiB) in hosted history while keeping `/history` list and poll payloads lightweight.
+- Preserve immediate external playback before thumbnail hydration completes and coalesce concurrent `GET /history/record` requests.
 
 ### 1.0.0
 

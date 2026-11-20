@@ -130,7 +130,7 @@
     .thumb { position: relative; display: grid; place-items: center; width: min(100px, 100%); aspect-ratio: 4 / 3; padding: 0; overflow: hidden; border: 1px solid #c9dcf6; border-radius: 8px; color: var(--blue-ink); background: var(--soft); }
     .thumb:hover { border-color: var(--blue); }
     .thumb img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; background: #eff6fd; }
-    .thumb-marker { position: absolute; right: 3px; bottom: 3px; display: grid; place-items: center; width: 21px; height: 21px; color: #fff; border-radius: 5px; background: #233246bd; }
+    .thumb-marker { position: absolute; z-index: 1; right: 3px; bottom: 3px; display: grid; place-items: center; width: 21px; height: 21px; color: #fff; border-radius: 5px; background: #233246bd; }
     .record-link { padding: 3px 1px; border: 0; background: none; color: var(--blue-ink); font-size: 11px; white-space: nowrap; }
     .record-link:hover { text-decoration: underline; }
     .result { margin-top: 20px; overflow: hidden; }
@@ -388,7 +388,7 @@
       <button id="history-next" class="record-link" type="button">下一页</button>
     </nav>
   </section>
-  <footer class="footer"><span class="footer-left"><svg class="icon"><use href="#i-code"/></svg>Pelican Test <span class="footer-tag">1.0.0</span></span></footer>
+  <footer class="footer"><span class="footer-left"><svg class="icon"><use href="#i-code"/></svg>Pelican Test <span class="footer-tag">1.0.1</span></span></footer>
 </main>
 <dialog id="preview-dialog" aria-labelledby="dialog-title">
   <div class="dialog-header">
@@ -431,6 +431,8 @@
   const MAX_TEXT = 512 * 1024;
   const MAX_FRAME = 2 * 1024 * 1024;
   const PAGE_SIZE = 20;
+  const MAX_THUMBNAIL_CACHE = 200;
+  const THUMBNAIL_CONCURRENCY = 2;
   const HOSTED_RECORD_BYTES = 900 * 1024;
   const HISTORY_KEY = 'cpr-pelican.history.v1';
   const RUN_KEY = 'cpr-pelican.run.v2.';
@@ -478,6 +480,11 @@
   let historyTask;
   let historyMessage = '';
   let renderedHistory;
+  let historyRenderEpoch = 0;
+  const thumbnailCache = new Map();
+  const inFlightRecords = new Map();
+  const thumbQueue = [];
+  let activeThumbnails = 0;
   let openedRecord = null;
   let openIntent = 0;
   let sparePreviewTicket = null;
@@ -572,9 +579,13 @@
     const text = new TextDecoder().decode(response.body);
     let value;
     try { value = JSON.parse(text); }
-    catch { throw new Error('插件返回了无法读取的数据，请刷新页面。'); }
+    catch {
+      const error = new Error('插件返回了无法读取的数据，请刷新页面。');
+      error.status = response.status;
+      throw error;
+    }
     if (response.status < 200 || response.status >= 300) {
-      const error = new Error(value.message || `读取失败（HTTP ${response.status}）`);
+      const error = new Error(value?.message || `读取失败（HTTP ${response.status}）`);
       error.status = response.status;
       throw error;
     }
@@ -1107,6 +1118,73 @@
     return record.trigger === 'scheduled' ? '定时' : record.trigger === 'refined' ? '多轮打磨' : '手动';
   }
 
+  function fetchRecord(id) {
+    if (!inFlightRecords.has(id)) {
+      const pending = request('GET', '/history/record', undefined, 'id=' + id)
+        .then(({ record }) => {
+          if (record?.id !== id) throw new Error('Unexpected saved record');
+          return record;
+        })
+        .finally(() => inFlightRecords.delete(id));
+      inFlightRecords.set(id, pending);
+    }
+    return inFlightRecords.get(id);
+  }
+
+  function cacheThumbnail(id, url) {
+    thumbnailCache.delete(id);
+    thumbnailCache.set(id, url);
+    if (thumbnailCache.size > MAX_THUMBNAIL_CACHE) {
+      thumbnailCache.delete(thumbnailCache.keys().next().value);
+    }
+  }
+
+  function getCachedThumbnail(id) {
+    const url = thumbnailCache.get(id);
+    if (url !== undefined) cacheThumbnail(id, url);
+    return url;
+  }
+
+  function attachThumbnailImage(button, url, recordId) {
+    const image = element('img');
+    image.alt = '';
+    image.loading = 'lazy';
+    image.decoding = 'async';
+    image.addEventListener('error', () => {
+      if (recordId !== undefined) cacheThumbnail(recordId, '');
+      image.remove();
+    }, { once: true });
+    image.src = url;
+    button.prepend(image);
+  }
+
+  async function hydrateThumbnail(job) {
+    const id = job.record.id;
+    try {
+      let url = getCachedThumbnail(id);
+      if (url === undefined) {
+        const saved = await fetchRecord(id);
+        const html = saved.source ? extractDocument(saved.source) : '';
+        url = html ? svgPreview(html, true) : '';
+        cacheThumbnail(id, url);
+      }
+      if (url && !closed && job.epoch === historyRenderEpoch) attachThumbnailImage(job.button, url, id);
+    } catch (error) {
+      if (error?.status >= 400 && error?.status < 500) cacheThumbnail(id, '');
+    }
+  }
+
+  function drainThumbnailQueue() {
+    while (!closed && activeThumbnails < THUMBNAIL_CONCURRENCY && thumbQueue.length) {
+      const job = thumbQueue.shift();
+      activeThumbnails++;
+      void hydrateThumbnail(job).finally(() => {
+        activeThumbnails--;
+        drainThumbnailQueue();
+      });
+    }
+  }
+
   function renderHistory() {
     if (closed) return;
     $('history-hint').textContent = historyMessage || (bridge
@@ -1122,7 +1200,10 @@
     const signature = JSON.stringify(savedRecords.map(record => record.id));
     if (signature === renderedHistory) return;
     renderedHistory = signature;
+    historyRenderEpoch++;
+    thumbQueue.length = 0;
     $('history-rows').replaceChildren(...savedRecords.map(historyRow));
+    drainThumbnailQueue();
   }
 
   function historyRow(record) {
@@ -1170,20 +1251,20 @@
       const button = element('button', 'thumb', bridge ? '播放' : html ? '看大图' : '打开');
       button.type = 'button';
       button.setAttribute('aria-label', (bridge ? '播放 ' : '打开 ') + record.model + ' 在 ' + date.toLocaleString('zh-CN') + ' 生成的结果');
-      const url = html ? svgPreview(html, true) : '';
-      if (url) {
-        const image = element('img');
-        image.alt = '';
-        image.loading = 'lazy';
-        image.decoding = 'async';
-        image.addEventListener('error', () => image.remove(), { once: true });
-        image.src = url;
-        button.append(image);
-      }
       if (bridge) {
         const marker = element('span', 'thumb-marker', '↗');
         marker.setAttribute('aria-hidden', 'true');
         button.append(marker);
+      }
+      if (html) {
+        const url = svgPreview(html, true);
+        if (url) attachThumbnailImage(button, url);
+      } else if (!source && record.hasSource) {
+        const url = getCachedThumbnail(record.id);
+        if (url) attachThumbnailImage(button, url, record.id);
+        else if (url === undefined && bridge && record.outcome !== 'no_svg') {
+          thumbQueue.push({ record, button, epoch: historyRenderEpoch });
+        }
       }
       button.addEventListener('click', () => bridge && typeof bridge.callbackTicket === 'function'
         ? playHistoryRecord(record) : openRecord(record, true));
@@ -1705,8 +1786,8 @@
     let source = record.source;
     if (!source && record.hasSource && bridge) {
       try {
-        const saved = (await request('GET', '/history/record', undefined, 'id=' + record.id)).record;
-        if (saved?.id !== record.id || !saved.source) throw new Error('Missing saved source');
+        const saved = await fetchRecord(record.id);
+        if (!saved.source) throw new Error('Missing saved source');
         source = saved.source;
       } catch {
         if (intent === openIntent) {
@@ -2101,6 +2182,7 @@
   }, 4000) : 0;
   window.addEventListener('pagehide', () => {
     closed = true;
+    thumbQueue.length = 0;
     controller?.abort();
     clearInterval(elapsedTimer);
     clearInterval(poll);
